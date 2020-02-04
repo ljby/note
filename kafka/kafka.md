@@ -159,6 +159,13 @@
 增加：exclude.internal.topics = false 除了内部topic
 ```
 
+读取/消费offset
+
+```shell
+#在kafka目录下
+kafka-console-consumer.sh _consumer_offsets --zookeeper 群名:端口号 --formatter ”kafka.coordinator.group.GroupMetadataManager\$OffsetsMessageFormatter“ --consumer.config config/consumer.properties --from-begining
+```
+
 ####  安装&练习
 
 1. 安装：brew install kafka
@@ -200,6 +207,19 @@
    kafka-console-consume.sh --topic test --bootstrap-server 集群名:9092    
    ```
 
+6. 启动消费者（同一group下多个消费者）
+
+```shell
+#修改consumer.properties配置
+group.id=组名
+
+kafka-console-consume.sh --topic test --bootstrap-server 集群名:9092 --consumer.config
+config/consumer.properties
+或者
+kafka-console-consume.sh --zookeeper 集群名:端口号 --topic test --consumer.config
+config/consumer.properties
+```
+
 ##### 修改配置文件
 
 ```shell
@@ -227,6 +247,8 @@ zookeeper.connect=localhost:2181
 #分发文件  
 使用xsync filename就能将filename分发到集群中的各个节点中  
 ```
+
+
 
 ##### 启动脚本-群起群关
 
