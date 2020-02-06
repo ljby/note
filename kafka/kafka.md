@@ -184,17 +184,123 @@ kafka-console-consumer.sh _consumer_offsets --zookeeper 群名:端口号 --forma
 
 ​		0.11版本开始支持，事务可以保证Kafka在Exactly Once语义的基础上，生产和消费可以跨分区和跨会话，要么全部成功，要么全部失败
 
+​		**事务能够保证Kafka topic下每个分区的原子写入，实现原子的“读取-处理-写入”过程**（即如果某个应用程序在某个topic tp0的偏移量X处读取到了消息A，并且在对消息A进行了一些处理（如B = F（A））之后将消息B写入topic tp1，则只有当消息A和B被认为被成功地消费并一起发布，或者完全不发布时，整个读取过程写入操作是原子的。）
+
+​		API要求事务性Producer的第一个操作应该是在Kafka集群中显示注册transactional.id。 当注册的时候，Kafka broker用给定的transactional.id检查打开的事务并且完成处理。 Kafka也增加了一个与transactional.id相关的epoch。Epoch存储每个transactional.id内部元数据。一旦这个epoch被触发，任何具有相同的transactional.id和更旧的epoch的Producer被视为僵尸，并被围起来, Kafka会拒绝来自这些Procedure的后续事务性写入。
+
+##### 事务场景
+
+1. 最简单的需求是producer发的多条消息组成一个事务这些消息需要对consumer同时可见或者同时不可见 
+2. producer可能会给多个topic，多个partition发消息，这些消息也需要能放在一个事务里面，这就形成了一个典型的分布式事务
+3. kafka的应用场景经常是应用先消费一个topic，然后做处理再发到另一个topic，这个consume-transform-produce过程需要放到一个事务里面，比如在消息处理或者发送的过程中如果失败了，消费位点也不能提交
+4. producer或者producer所在的应用可能会挂掉，新的producer启动以后需要知道怎么处理之前未完成的事务 
+5. 流式处理的拓扑可能会比较深，如果下游只有等上游消息事务提交以后才能读到，可能会导致rt非常长吞吐量也随之下降很多，所以需要实现read committed和read uncommitted两种事务隔离级别
+
+##### 关键概念
+
+1. 事务管理中事务日志是必不可少的，kafka使用一个内部topic来保存事务日志，这个设计和之前使用内部topic保存位点的设计保持一致。事务日志是Transaction Coordinator管理的状态的持久化，因为不需要回溯事务的历史状态，所以事务日志只用保存最近的事务状态
+2. 因为事务存在commit和abort两种操作，而客户端又有read committed和read uncommitted两种隔离级别，所以消息队列必须能标识事务状态，这个被称作Control Message
+3. producer挂掉重启或者漂移到其它机器需要能关联的之前的未完成事务所以需要有一个唯一标识符来进行关联，这个就是TransactionalId，一个producer挂了，另一个有相同TransactionalId的producer能够接着处理这个事务未完成的状态。注意不要把TransactionalId和数据库事务中常见的transaction id搞混了，kafka目前没有引入全局序，所以也没有transaction id，这个TransactionalId是用户提前配置的
+4. TransactionalId能关联producer，也需要避免两个使用相同TransactionalId的producer同时存在，所以引入了producer epoch来保证对应一个TransactionalId只有一个活跃的producer epoch
+
 ##### Producer事务
 
 ​		为了实现跨跨分区和跨会话的事务，需要引入一个全局唯一的TransactionID，并将producer获得的PID和TransactionID绑定，这样Producer重启后就可以通过正在进行的TransactionID获取原来的PID
 
 ​		为了管理TransactionID，kafka引入了一个新的组件Transaction Coordinator。Producer就是通过和Transaction Coordinator交互获得TransactionID对应的任务状态。Transaction Coordinator还负责将事务所有写入kafka的一个内部topic，这样即使重启整个服务，由于事务状态得到保存，进行中的事务状态可以得到恢复，从而继续运行
 
-​		解决精准一次性写入到kafka集群
+​		解决精准一次性写入到kafka集群问题
+
+```java
+/*producer提供了五个事务方法：
+initTransactions beginTransaction sendOffsets commitTransaction abortTransaction
+*/
+
+//事务id
+properties.put(ProducerConfig.TRANSACTIONAL_ID_CONFIG, "producer-1");// 每台机器唯一
+properties.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);// 设置幂等性
+
+producer = new KafkaProducer<>(properties);
+        //初始化事务
+        producer.initTransactions();
+        try {
+            Thread.sleep(1000);
+            //开启事务
+            producer.beginTransaction();
+            int num = 0;
+            while (num < 10) {
+                String message = "message--->" + num;
+                producer.send(new ProducerRecord<>("test", message), (recordMetadata, e) -> {
+                    if(e == null) {
+                        System.out.println("分区：" + recordMetadata.partition() + "offset：" +recordMetadata.offset());
+                    }
+                });
+                num++;
+            }
+            //提交事务
+            producer.commitTransaction();
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        } finally {
+            //终止事务
+            producer.abortTransaction();
+        }
+        producer.close();
+
+```
+
+##### consume-Transform-Produce模式
+
+```java
+//Produce的properties配置如上例代码
+//consume的properties的配置需增加：
+properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "true");
+properties.put(ConsumerConfig.AUTO_COMMIT_INTERVAL_MS_CONFIG, "1000");
+properties.put(ConsumerConfig.ISOLATION_LEVEL_CONFIG, "read_committed");//事务隔离级别
+
+public static void main(String[] args) {
+        // 创建生产者
+        KafkaProducer<String, String> producer = new KafkaProducer<>(getProducerProperties());
+        // 创建消费者
+        KafkaConsumer<String, String> consumer = new KafkaConsumer<>(getConsumerProperties());
+        // 初始化事务
+        producer.initTransactions();
+        // 订阅主题
+        consumer.subscribe(Arrays.asList("cons-tran-prod"));
+        for(;;){
+            // 开启事务
+            producer.beginTransaction();
+            // 接受消息
+            ConsumerRecords<String, String> records = consumer.poll(500);
+            // 处理逻辑
+            try {
+                Map<TopicPartition, OffsetAndMetadata> commits = new HashMap<>();
+                for(ConsumerRecord record : records){
+                    // 处理消息
+                    out.println("offset = " + record.offset()+ "，key =" + record.key() + "，value =" + record.value());
+                    // 记录提交的偏移量
+                    commits.put(new TopicPartition(record.topic(), record.partition()),new OffsetAndMetadata(record.offset()));
+                    // 产生新消息
+                    producer.send(new ProducerRecord<>("consumer-send", record.value() + "send"));
+                }
+                // 提交偏移量
+                producer.sendOffsetsToTransaction(commits,"groupTest");
+                // 事务提交
+                producer.commitTransaction();
+
+            }catch (Exception e){
+                e.printStackTrace();
+                //终止事务
+                producer.abortTransaction();
+            }
+        }
+```
 
 ##### Consumer事务
 
 ​		对于Consumer而言，事务的保证就会相对较弱，尤其无法保证commit的信息被精确消费，这是由于Consumer可以通过offset访问任何信息，而且不同的segment file生命周期不同，同一事务的消息可能会在重启后出现被删除的情况
+
+​		Kafka保证Consumer最终只能提供非事务性消息或提交事务性消息。它将保留来自未完成事务的消息，并过滤掉已中止事务的消息。
 
 #### KafkaAPI
 
@@ -267,7 +373,7 @@ public class ProducerDemo extends Thread {
 }
 ```
 
-自定义分区器
+##### 自定义分区器
 
 ```java
 import java.util.Map;
@@ -788,3 +894,105 @@ public interface Configurable {
     void configure(Map<String, ?> var1);
 }
 ```
+
+#### Kafka事务原理
+
+##### 事务协调器和事务日志
+
+​		在Kafka 0.11.0引入事务Coordinator和事务日志
+
+​		事务Coordinator是每个KafkaBroker内部运行的一个模块。事务日志是一个内部的Kafka Topic。每个Coordinator拥有事务日志所在分区的子集，即, 这些borker中的分区都是Leader。每个transactional.id都通过一个简单的哈希函数映射到事务日志的特定分区，事务日志文件__transaction_state-0。这意味着只有一个Broker拥有给定的transactional.id。通过这种方式，我们利用Kafka可靠的复制协议和Leader选举流程来确保事务协调器始终可用，并且所有事务状态都能够持久存储
+
+​		事务日志只保存事务的最新状态而不是事务中的实际消息。消息只存储在实际的Topic的分区中。事务可以处于诸如“Ongoing”，“prepare commit”和“Completed”之类的各种状态中。正是这种状态和关联的元数据存储在事务日志中
+
+##### 事务数据流
+
+​		数据流在抽象层面上有四种不同的类型。
+
+* producer和事务coordinator的交互
+
+　　执行事务时，Producer向事务协调员发出如下请求：
+
+1. initTransactions API向coordinator注册一个transactional.id。 此时，coordinator使用该transactional.id关闭所有待处理的事务，并且会避免遇到僵尸实例，由具有相同的transactional.id的Producer的另一个实例启动的任何事务将被关闭和隔离。每个Producer会话只发生一次
+2. 当Producer在事务中第一次将数据发送到分区时，首先向coordinator注册分区
+3. 当应用程序调用commitTransaction或abortTransaction时，会向coordinator发送一个请求以开始两阶段提交协议
+
+* Coordinator和事务日志交互
+
+　　随着事务的进行，Producer发送上面的请求来更新Coordinator上事务的状态。事务Coordinator会在内存中保存每个事务的状态，并且把这个状态写到事务日志中（这是以三种方式复制的，因此是持久保存的）
+
+　　事务Coordinator是读写事务日志的唯一组件。如果一个给定的Borker故障了，一个新的Coordinator会被选为新的事务日志的Leader，这个事务日志分割了这个失效的代理，它从传入的分区中读取消息并在内存中重建状态
+
+* Producer将数据写入目标Topic所在分区
+
+　　在Coordinator的事务中注册新的分区后，Producer将数据正常地发送到真实数据所在分区。这与producer.send流程完全相同，但有一些额外的验证，以确保Producer不被隔离
+
+* Topic分区和Coordinator的交互
+
+1. 在Producer发起提交（或中止）之后，协调器开始两阶段提交协议。
+2. 在第一阶段，Coordinator将其内部状态更新为“prepare_commit”并在事务日志中更新此状态。一旦完成了这个事务，无论发生什么事，都能保证事务完成
+3. Coordinator然后开始阶段2，在那里它将事务提交标记写入作为事务一部分的Topic分区
+4. 这些事务标记不会暴露给应用程序，但是在read_committed模式下被Consumer使用来过滤掉被中止事务的消息，并且不返回属于开放事务的消息（即那些在日志中但没有事务标记与他们相关联）
+5. 一旦标记被写入，事务协调器将事务标记为“完成”，并且Producer可以开始下一个事务
+
+##### 事务的相关配置
+
+```shell
+#Broker configs
+#在ms中，事务协调器在生产者TransactionalId提前过期之前等待的最长时间，并且没有从该生产者TransactionalId接收到任何事务状态更新。默认是604800000(7天)
+ransactional.id.timeout.ms：
+#事务允许的最大超时：如果客户端请求的事务时间超过此时间，broke将在InitPidRequest中返回InvalidTransactionTimeout错误。这可以防止客户机超时过大，从而导致用户无法从事务中包含的主题读取内容
+默认值为900000(15分钟)。这是消息事务需要发送的时间的保守上限。
+max.transaction.timeout.ms
+#事务状态topic的副本数量。默认值:3
+transaction.state.log.replication.factor
+#事务状态主题的分区数。默认值:50
+transaction.state.log.num.partitions
+#事务状态主题的每个分区ISR最小数量。默认值:2
+transaction.state.log.min.isr
+#事务状态主题的segment大小。默认值:104857600字节
+transaction.state.log.segment.bytes
+
+#Producer configs
+enable.idempotence：开启幂等
+#事务超时时间:事务协调器在主动中止正在进行的事务之前等待生产者更新事务状态的最长时间。
+#默认是60000
+transaction.timeout.ms
+#用于事务性交付的TransactionalId。这支持跨多个生产者会话的可靠性语义，因为它允许客户端确保使用相同TransactionalId的事务在启动任何新事务之前已经完成。如果没有提供TransactionalId，则生产者仅限于幂等交付
+transactional.id
+
+#Consumer configs
+isolation.level
+read_uncommitted：以偏移顺序使用已提交和未提交的消息。
+read_committed：仅以偏移量顺序使用非事务性消息或已提交事务性消息。为了维护偏移排序，这个设置意味着我们必须在使用者中缓冲消息，直到看到给定事务中的所有消息。
+```
+
+##### 事务性能以及如何优化
+
+* Producer打开事务之后的性能
+
+  事务如何执行：首先，事务只造成中等的写入放大，额外的写入在于：
+
+1. 对于每个事务，我们都有额外的RPC向Coordinator注册分区
+
+2. 在完成事务时，必须将一个事务标记写入参与事务的每个分区。同样，事务Coordinator在单个RPC中批量绑定到同一个Borker的所有标记，所以我们在那里保存RPC开销。但是在事务中对每个分区进行额外的写操作是无法避免的
+
+3. 最后，我们将状态更改写入事务日志。这包括写入添加到事务的每批分区，“prepare_commit”状态和“complete_commit”状态
+
+   ​        开销与作为事务一部分写入的消息数量无关，拥有更高吞吐量的关键是**每个事务包含更多的消息**
+
+   ​        实际上，对于Producer以最大吞吐量生产1KB记录，每100ms提交消息导致吞吐量仅降低3％。较小的消息或较短的事务提交间隔会导致更严重的降级
+
+   ​        增加事务时间的主要折衷是增加了端到端延迟。回想一下，Consume阅读事务消息不会传递属于公开传输的消息。因此，提交之间的时间间隔越长，消耗的应用程序就越需要等待，从而增加了端到端的延迟
+
+* Consumer打开之后的性能
+
+  Consumer在开启事务的场景比Producer简单得多，它需要做的是：
+
+  1. 过滤掉属于中止事务的消息
+
+  2. 不返回属于公开事务一部分的事务消息
+
+  ​        因此，当以read_committed模式读取事务消息时，事务Consumer的吞吐量没有降低。这样做的主要原因是我们在读取事务消息时保持零拷贝读取
+
+  ​       此外，Consumer不需要任何缓冲等待事务完成。相反，Broker不允许提前抵消包括公开事，so，Consumer是非常轻巧和高效的
